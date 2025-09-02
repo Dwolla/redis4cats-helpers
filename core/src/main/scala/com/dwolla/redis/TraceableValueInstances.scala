@@ -1,0 +1,38 @@
+package com.dwolla.redis
+
+import cats.effect.Trace as _
+import dev.profunktor.redis4cats.effects.*
+import io.circe.*
+import io.circe.literal.*
+import io.circe.syntax.*
+import natchez.*
+
+import scala.concurrent.duration.*
+
+private[redis] object TraceableValueInstances extends TraceableValueInstancesPlatform {
+  implicit def optionalTraceableValue[A: TraceableValue]: TraceableValue[Option[A]] = {
+    case Some(a) => TraceableValue[A].toTraceValue(a)
+    case None => TraceableValue[String].toTraceValue("None")
+  }
+
+  implicit val unitTraceableValue: TraceableValue[Unit] = TraceableValue[String].contramap(_ => "()")
+
+  implicit val finiteDurationTraceableValue: TraceableValue[FiniteDuration] = TraceableValue[String].contramap(_.toString())
+  private implicit val existenceEncoder: Encoder[SetArg.Existence] = Encoder[String].contramap {
+    case SetArg.Existence.Nx => "Nx"
+    case SetArg.Existence.Xx => "Xx"
+  }
+  private implicit val ttlEncoder: Encoder[SetArg.Ttl] = Encoder[String].contramap {
+    case SetArg.Ttl.Keep => "Keep"
+    case SetArg.Ttl.Ex(duration) => s"${duration.toSeconds} seconds"
+    case SetArg.Ttl.Px(duration) => s"${duration.toMillis} millis"
+  }
+
+  implicit val setArgsTraceableValue: TraceableValue[SetArgs] = TraceableValue[String].contramap { args =>
+    json"""{
+      "existence": ${args.existence.map(_.asJson)},
+      "ttl": ${args.ttl.map(_.asJson)}
+    }""".noSpaces
+  }
+
+}
