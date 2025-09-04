@@ -24,6 +24,14 @@ import scala.collection.immutable.*
 import scala.concurrent.duration.*
 import scala.math.Ordered.orderingToOrdered
 
+/**
+ * A trait representing a local cache pool that provides access to the current cache state
+ * and a resource pool of cache instances.
+ *
+ * @tparam F The effect type used for computations, typically implementing a type class like Monad or Applicative.
+ * @tparam K The type of keys used in the cache.
+ * @tparam V The type of values stored in the cache.
+ */
 trait LocalCachePool[F[_], K, V] {
   def cacheState: F[CacheState[K, V]]
   def pool: KeyPool[F, Unit, RedisCache[F, K, V]]
@@ -102,6 +110,16 @@ private class MaterializeStateTransitionsUsingAtomicCell[F[_] : Temporal : Trace
     }
 }
 
+/**
+ * Represents a transformation from a stateful computation over `CacheState` to a stateful computation over `InstanceState`.
+ *
+ * This is required to bridge stateful computations defined in terms of `CacheState` (which is shared across instances)
+ * to operations working directly with `InstanceState` (which encapsulates `CacheState` along with instance-local watches).
+ *
+ * @tparam F The effect type that must have an instance for `Functor`.
+ * @tparam K The type of keys used in the cache.
+ * @tparam V The type of values stored in the cache.
+ */
 private class UnfocusCacheStateToInstanceState[F[_] : Functor, K, V] extends (StateT[F, CacheState[K, V], *] ~> StateT[F, InstanceState[K, V], *]) {
   override def apply[A](fa: StateT[F, CacheState[K, V], A]): StateT[F, InstanceState[K, V], A] =
     fa.transformS[InstanceState[K, V]](_.cacheState, _.withCacheState(_))
@@ -111,6 +129,16 @@ object LocalCache {
   type Watches[K, V] = SortedMap[K, V]
   type CacheState[K, V] = Map[K, (V, Option[Instant])]
 
+  /**
+   * Represents the state of a [[LocalCache]] instance, encapsulating the cache state
+   * and watches associated with it. Cache state is shared by all instances in a
+   * [[LocalCachePool]] while watches are local to an instance.
+   *
+   * @param cacheState the current state of the cache
+   * @param watches    the watches monitoring changes to the key-value pairs
+   * @tparam K the type of keys in the cache
+   * @tparam V the type of values in the cache
+   */
   class InstanceState[K, V] private(val cacheState: CacheState[K, V],
                                     val watches: Watches[K, V]) {
     def withCacheState(cs: CacheState[K, V]) = new InstanceState(cs, watches)
@@ -129,19 +157,22 @@ object LocalCache {
       tuple._1.forEvalModify(tuple._2)
   }
 
-  /** TODO update scaladoc
-   * A local in-memory cache implementation of the `RedisCache` trait that ultimately operates
+  /**
+   * A local in-memory cache implementation of the [[RedisCore]] trait that ultimately operates
    * using an `AtomicCell`, supporting custom expiration times and race condition behaviors.
    *
-   * This class implements `CacheState[StateT[F, InstanceState[K, V], *], K, V]` and
-   * is then converted to an implementation in `F[_]` in its companion object. This allows us
-   * to sequence a series of `StateT[F, InstanceState[K, V], Unit]` operations together
+   * This class implements `RedisCore[StateT[F, CacheState[K, V], *], K, V]` and
+   * is then converted to an implementation in `F[_]` in its companion object.
+   * (`CacheState[K, V]` is a focused version of the `InstanceState[K, V]`.
+   * `CacheState[K, V]` is shared by multiple instances, while `InstanceState[K, V]`
+   * has additional state specific to the instance of [[RedisCache]].)
+   *
+   * This allows us to sequence a series of `StateT[F, InstanceState[K, V], Unit]` operations together
    * in our [[LocalRedisTransactions]], allowing them to operate as a fused
    * `InstanceState[K, V] => F[(InstanceState[K, V], Unit)]` passed to
    * [[AtomicCell.evalModify]]. Without this indirection, any `set` operations executed inside
    * the `evalModify` cause deadlocks, preventing the successful implementation of [[updateExisting]].
    *
-   * @param watches     tracks watches key/values during transactional operations
    * @param verboseMode when true, emit quite a bit of detail about operations to the console. otherwise, be quiet
    * @tparam F the effect type in which to operate
    * @tparam K the type of the key in the cache
@@ -250,13 +281,13 @@ object LocalCache {
     }
   }
 
-  /** TODO update scaladoc
-   * Creates and initializes a new instance of [[CacheState]] with provided configurations and dependencies.
+  /**
+   * Creates and initializes a new instance of [[LocalCachePool]] with provided configurations and dependencies.
    *
-   * This initializes a [[LocalCache]] instance, which is a `CacheState[StateT[F, InstanceState[K, V], *], K, V]`.
-   * The `StateT` effect allows us to logically call [[LocalCache.set]] inside [[LocalCache.updateExisting]], which would
-   * normally cause a deadlock, since [[LocalCache.updateExisting]] obtains exclusive access to update the underlying
-   * `AtomicCell[F, InstanceState[K, V]]`. When the `set` operation is a `StateT`, it can be given the current
+   * This initializes a [[RedisCache.RedisCacheImpl]] instance using `StateT[F, InstanceState[K, V], *]`.
+   * The `StateT` effect allows us to logically call [[RedisCache.set]] inside [[RedisCache.updateExisting]], which would
+   * normally cause a deadlock, since [[RedisCache.updateExisting]] obtains exclusive access to update the underlying
+   * `AtomicCell[F, CacheState[K, V]]`. When the `set` operation is a `StateT`, it can be given the current
    * state and allowed to compute the next state, which is then used by [[AtomicCell.evalModify]] to update the cell.
    *
    * @param explodeWhen         A partial function specifying conditions under which specific cache operations
@@ -265,12 +296,12 @@ object LocalCache {
    *                            should introduce delays. Defaults to an empty partial function.
    * @param verboseMode         A Boolean flag to enable or disable verbose logging. Defaults to `false`.
    * @param transactionalRetryPolicy a [[FunctionK]] that may retry the effect when [[TransactionDiscarded]] is raised
-   * @tparam F An effect type that supports `Console`, `Async`, and `Trace` type classes.
+   * @tparam F An effect type that supports `Console`, `Temporal`, and `Trace` type classes.
    * @tparam K The type of keys in the cache, which must have instances for `KeyEncoder`,
    *           `Ordering`, and `TraceableValue`.
    * @tparam V The type of values in the cache, which must have instances for `Empty`, `Encoder`,
    *           `Eq`, and `TraceableValue`.
-   * @return An effect that, when evaluated, returns the initialized `CacheState` instance.
+   * @return An effect that, when evaluated, returns the initialized `Resource[F, LocalCachePool[F, K, V]]`.
    */
   def apply[
     F[_] : Temporal : Console : Trace,
@@ -355,6 +386,9 @@ object LocalCache {
 
 }
 
+/**
+ * Retries transactions when `TransactionDiscarded` is raised by the underlying library.
+ */
 class TransactionalRetryPolicy[F[_]: MonadThrow : Sleep : Trace] extends (F ~> F) {
   private implicit val finiteDurationEncoder: Encoder[FiniteDuration] = Encoder[Long].contramap(_.toMillis)
 
@@ -444,8 +478,6 @@ object CacheOperation {
  *
  * @tparam K Type of the key used in the cache
  * @tparam V Type of the value stored in the cache
- * @param watched The currently watched keys and their values when each watch was started. Passed as a constructor
- *                parameter because initializing the [[Ref]] is effectful.
  * @param verboseMode when true, emit quite a bit of detail about operations to the console. otherwise, be quiet
  */
 class LocalRedisTransactions[F[_] : MonadCancelThrow : Clock : Console : Trace, K: Ordering : KeyEncoder, V: Eq : Encoder](verboseMode: Boolean)
@@ -536,21 +568,81 @@ class LocalCacheBuilder[F[_], K, V] private(explodeWhen: PartialFunction[CacheOp
                                             sleepAfterWhen: PartialFunction[CacheOperation[K, V], FiniteDuration],
                                             verboseMode: Boolean,
                                             transactionalRetryPolicy: StateT[F, InstanceState[K, V], *] ~> StateT[F, InstanceState[K, V], *]) {
+  /**
+   * Configures the `LocalCacheBuilder` to throw exceptions when specific cache operations
+   * match the provided partial function.
+   *
+   * @param pf A partial function that maps specific `CacheOperation` instances to `Throwable`.
+   *           When a cache operation matches the partial function, the corresponding exception
+   *           is thrown.
+   * @return A new instance of `LocalCacheBuilder` configured with the provided partial function
+   *         for throwing exceptions during certain cache operations.
+   */
   def explodingWhen(pf: PartialFunction[CacheOperation[K, V], Throwable]): LocalCacheBuilder[F, K, V] =
     new LocalCacheBuilder(pf, sleepAfterWhen, verboseMode, transactionalRetryPolicy)
 
+  /**
+   * Configures the `LocalCacheBuilder` to introduce delays (or "sleep") when specific cache operations
+   * match the conditions defined in the provided partial function.
+   *
+   * @param pf A partial function that maps specific `CacheOperation` instances to a `FiniteDuration`.
+   *           When a cache operation matches the partial function, the corresponding duration is used
+   *           to introduce a delay for that operation.
+   * @return A new instance of `LocalCacheBuilder`
+   */
   def sleepingAfter(pf: PartialFunction[CacheOperation[K, V], FiniteDuration]): LocalCacheBuilder[F, K, V] =
     new LocalCacheBuilder(explodeWhen, pf, verboseMode, transactionalRetryPolicy)
 
+  /**
+   * Configures the `LocalCacheBuilder` to enable verbose mode, which may include
+   * additional logging or diagnostic output for debugging purposes.
+   *
+   * @return A new instance of `LocalCacheBuilder` with verbose mode enabled.
+   */
   def verbose(): LocalCacheBuilder[F, K, V] =
     new LocalCacheBuilder(explodeWhen, sleepAfterWhen, verboseMode = true, transactionalRetryPolicy)
 
+  /**
+   * Configures the `LocalCacheBuilder` to enable or disable verbose logging.
+   *
+   * @param b A Boolean flag indicating whether verbose logging should be enabled.
+   *          If `true`, verbose mode is activated; if `false`, it is disabled.
+   * @return A new instance of `LocalCacheBuilder` configured with the specified verbose logging mode.
+   */
   def withVerbose(b: Boolean): LocalCacheBuilder[F, K, V] =
     new LocalCacheBuilder(explodeWhen, sleepAfterWhen, verboseMode = b, transactionalRetryPolicy)
 
+  /**
+   * Configures the `LocalCacheBuilder` to use a stateful transactional retry policy.
+   * This method allows for customization of the retry behavior by supplying a transformation
+   * from one state transition to another in the context of a `StateT` monad.
+   *
+   * For a simpler version that doesn't have access to the [[InstanceState]], see [[withTransactionalRetryPolicy]]
+   * @param trp A transformation function that maps one stateful computation to another
+   *            within the `StateT` monad. This allows you to specify how state transitions
+   *            and retries should be handled in a transactional manner.
+   * @return A new instance of `LocalCacheBuilder` configured with the specified
+   *         stateful transactional retry policy.
+   * @see [[withTransactionalRetryPolicy]]
+   */
   def withStatefulTransactionalRetryPolicy(trp: StateT[F, InstanceState[K, V], *] ~> StateT[F, InstanceState[K, V], *]): LocalCacheBuilder[F, K, V] =
     new LocalCacheBuilder(explodeWhen, sleepAfterWhen, verboseMode, trp)
 
+  /**
+   * Configures the `LocalCacheBuilder` to use a transactional retry policy.
+   * This policy applies a transformation function to the underlying effectual computations
+   * used within the cache's operations, enabling customization of behavior during retries.
+   *
+   * Retry policies set with this method won't have access to the cache state. For a more
+   * advanced version, see [[withStatefulTransactionalRetryPolicy]].
+   *
+   * @param fk A natural transformation from `F` to `F` that defines how computations within
+   *           the effectful context should be transformed. This can be used to modify or
+   *           extend the behavior of cache operations during transactional retries.
+   * @param F  An implicit instance of the `Monad` typeclass for the effect type `F`.
+   * @return A new instance of `LocalCacheBuilder` configured with the specified transactional retry policy.
+   * @see [[withStatefulTransactionalRetryPolicy]]
+   */
   def withTransactionalRetryPolicy(fk: F ~> F)
                                   (implicit F: Monad[F]): LocalCacheBuilder[F, K, V] = {
     val trp = new (StateT[F, InstanceState[K, V], *] ~> StateT[F, InstanceState[K, V], *]) {
@@ -561,7 +653,26 @@ class LocalCacheBuilder[F[_], K, V] private(explodeWhen: PartialFunction[CacheOp
     new LocalCacheBuilder(explodeWhen, sleepAfterWhen, verboseMode, trp)
   }
 
-
+  /**
+   * Builds and initializes a `LocalCachePool` resource based on the current configuration
+   * of the `LocalCacheBuilder`. This method finalizes the cache construction process
+   * by combining various configurations like exception handling, sleep policies, verbose mode,
+   * and transactional retry policies.
+   *
+   * @param F   An implicit instance of `Temporal[F]`, providing the capability to work with temporal effects.
+   * @param C   An implicit instance of `Console[F]`, enabling console input and output operations.
+   * @param T   An implicit instance of `Trace[F]`, allowing tracing capabilities for diagnostics.
+   * @param KE  An implicit instance of `KeyEncoder[K]`, used to encode cache keys of type `K`.
+   * @param O   An implicit instance of `Ordering[K]`, providing a comparison mechanism for keys of type `K`.
+   * @param KTV An implicit instance of `TraceableValue[K]`, allowing tracing for cache keys of type `K`.
+   * @param VE  An implicit instance of `Encoder[V]`, used to encode cache values of type `V`.
+   * @param VEq An implicit instance of `Eq[V]`, supplying equality comparison for cache values of type `V`.
+   * @param VTV An implicit instance of `TraceableValue[V]`, allowing tracing for cache values of type `V`.
+   * @param Mk  An implicit instance of `Ref.Make`, which facilitates the creation of `Ref` for state management
+   *            in the context of `StateT` monad.
+   * @return A `Resource[F, LocalCachePool[F, K, V]]`, which represents the initialized local cache pool
+   *         with its associated configurations and ready for use.
+   */
   def build()
            (implicit
             F: Temporal[F],
