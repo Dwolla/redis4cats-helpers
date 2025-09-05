@@ -50,6 +50,7 @@ lazy val `redis4cats-localcache` = project
   .settings(
     description := "Provides a fake in-memory implementation of Redis semantics for Get/Set/Delete/UpdateExisting/DeleteExisting using Cats Effect.",
     libraryDependencies ++= Seq(
+      "org.typelevel" %% "keypool" % "0.4.10",
       "com.github.cb372" %% "cats-retry" % "3.1.3",
     ),
     scalacOptions ++= Seq(

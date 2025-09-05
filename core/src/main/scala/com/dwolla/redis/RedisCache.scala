@@ -3,6 +3,7 @@ package com.dwolla.redis
 import cats.*
 import cats.effect.{Trace as _, *}
 import cats.syntax.all.*
+import cats.effect.syntax.all.*
 import com.dwolla.redis.RedisCache.UpdateOrDeleteExistingRedisValueException
 import com.dwolla.redis.TraceableValueInstances.*
 import dev.profunktor.redis4cats.algebra.*
@@ -69,19 +70,83 @@ trait RedisCache[F[_], K, V] { outer =>
     override def deleteExisting(key: K, existing: V2): F[Unit] =
       outer.deleteExisting(key, g(existing))
   }
+
+  // TODO remove this and figure out how to get the FunctorK from cats-tagless to work in LocalCache.apply
+  final def mapK[G[_]](fk: F ~> G): RedisCache[G, K, V] = new RedisCache[G, K, V] {
+    override def get(key: K): G[Option[V]] =
+      fk(outer.get(key))
+
+    override def set(key: K, value: V, setArgs: SetArgs): G[Boolean] =
+      fk(outer.set(key, value, setArgs))
+
+    override def del(key: K): G[Long] =
+      fk(outer.del(key))
+
+    override def updateExisting(key: K, existing: V)
+                               (newValue: V, expiresIn: FiniteDuration): G[Unit] =
+      fk(outer.updateExisting(key, existing)(newValue, expiresIn))
+
+    override def deleteExisting(key: K, existing: V): G[Unit] =
+      fk(outer.deleteExisting(key, existing))
+  }
+
 }
 
 object RedisCache extends RedisCachePlatform {
-  private type LimitedRedisCache[F[_], K, V] =
+  private[redis] type LimitedRedisCache[F[_], K, V] =
     Getter[F, K, V] & Setter[F, K, V] & KeyCommands[F, K] & HighLevelTx[F] & Watcher[F, K]
 
   case class UpdateOrDeleteExistingRedisValueException[K, V](key: K, expected: V, obtained: Option[V])
     extends RuntimeException(s"Cache contained unexpected value: expected «$expected» but found «$obtained»")
       with NoStackTrace
 
-  private class DelegatingRedisCacheImpl[F[_] : Temporal : Trace, K: TraceableValue, V: TraceableValue](instance: LimitedRedisCache[F, K, V],
-                                                                                                        transactionalRetryPolicy: F ~> F)
-    extends TransactionalRedisCommandsAlgebra[F, K, V](instance, transactionalRetryPolicy) {
+  def apply[F[_] : Temporal : Trace, K: TraceableValue, V : TraceableValue](instance: LimitedRedisCache[F, K, V],
+                                                                            transactionalRetryPolicy: F ~> F): RedisCache[F, K, V] = {
+    val core = RedisCore(instance)
+    val tx = TransactionalRedisCommandsAlgebra(core, instance, transactionalRetryPolicy)
+    new RedisCacheImpl(core, tx)
+  }
+
+  private[redis] class RedisCacheImpl[F[_], K, V](core: RedisCore[F, K, V],
+                                                  tx: TransactionalRedisCommandsAlgebra[F, K, V]) extends RedisCache[F, K, V] {
+    override def get(key: K): F[Option[V]] =
+      core.get(key)
+
+    override def set(key: K, value: V, setArgs: SetArgs): F[Boolean] =
+      core.set(key, value, setArgs)
+
+    override def del(key: K): F[Long] =
+      core.del(key)
+
+    override def updateExisting(key: K, existing: V)
+                               (newValue: V, expiresIn: FiniteDuration): F[Unit] =
+      tx.updateExisting(key, existing)(newValue, expiresIn)
+
+    override def deleteExisting(key: K, existing: V): F[Unit] =
+      tx.deleteExisting(key, existing)
+
+  }
+}
+
+trait RedisCore[F[_], K, V] { outer =>
+  def get(key: K): F[Option[V]]
+
+  def set(key: K, value: V, setArgs: SetArgs): F[Boolean]
+
+  def del(key: K): F[Long]
+
+  final def mapK[G[_]](fk: F ~> G): RedisCore[G, K, V] = new RedisCore[G, K, V] {
+    override def get(key: K): G[Option[V]] = fk(outer.get(key))
+    override def set(key: K, value: V, setArgs: SetArgs): G[Boolean] = fk(outer.set(key, value, setArgs))
+    override def del(key: K): G[Long] = fk(outer.del(key))
+  }
+}
+
+object RedisCore {
+  def apply[F[_] : Temporal : Trace, K: TraceableValue, V : TraceableValue](instance: Getter[F, K, V] & Setter[F, K, V] & KeyCommands[F, K]): RedisCore[F, K, V] =
+    new DelegatingRedisCacheImpl(instance)
+
+  private class DelegatingRedisCacheImpl[F[_] : Temporal : Trace, K: TraceableValue, V: TraceableValue](instance: Getter[F, K, V] & Setter[F, K, V] & KeyCommands[F, K]) extends RedisCore[F, K, V] {
 
     override def get(key: K): F[Option[V]] = Trace[F].span("DelegatingRedisCacheImpl.get") {
       for {
@@ -107,45 +172,54 @@ object RedisCache extends RedisCachePlatform {
       } yield recordsDeleted
     }
   }
-
-  def apply[F[_] : Temporal : Trace, K: TraceableValue, V : TraceableValue](instance: LimitedRedisCache[F, K, V],
-                                                                            transactionalRetryPolicy: F ~> F): RedisCache[F, K, V] =
-    new DelegatingRedisCacheImpl(instance, transactionalRetryPolicy)
 }
 
-abstract class TransactionalRedisCommandsAlgebra[F[_] : MonadThrow : Trace, K: TraceableValue, V: TraceableValue](instance: HighLevelTx[F] & Watcher[F, K],
-                                                                                                                  transactionalRetryPolicy: F ~> F,
-                                                                                                                 ) extends RedisCache[F, K, V] {
-  private def raiseUpdateOrDeleteExistingRedisValueException(key: K, existing: V, currentValue: Option[V]): F[Unit] =
-    instance.unwatch >> UpdateOrDeleteExistingRedisValueException(key, existing, currentValue).raiseError
-
-  private def executeIfValueIsUnchanged(key: K, existing: V)
-                                       (operations: List[F[Unit]]): F[Unit] = transactionalRetryPolicy {
-    for {
-      _ <- instance.watch(key)
-      currentValue <- get(key)
-      _ <- currentValue.traverse_(cv => Trace[F].put("currentValue" -> cv))
-      _ <- raiseUpdateOrDeleteExistingRedisValueException(key, existing, currentValue).unlessA(currentValue.contains(existing))
-      _ <- instance.transact_(operations)
-    } yield ()
-  }
-
+trait TransactionalRedisCommandsAlgebra[F[_], K, V] {
   def updateExisting(key: K, existing: V)
-                    (newValue: V, expiresIn: FiniteDuration): F[Unit] =
-    Trace[F].span("TransactionalRedisCommandsAlgebra.updateExisting") {
-      val setArgs = SetArgs(SetArg.Ttl.Px(expiresIn))
-      for {
-        _ <- Trace[F].put("key" -> key, "existing" -> existing, "newValue" -> newValue, "setArgs" -> setArgs)
-        _ <- executeIfValueIsUnchanged(key, existing)(List(set(key, newValue, setArgs).void))
-      } yield ()
+                    (newValue: V, expiresIn: FiniteDuration): F[Unit]
+
+  def deleteExisting(key: K, existing: V): F[Unit]
+}
+
+object TransactionalRedisCommandsAlgebra {
+  def apply[F[_] : MonadCancelThrow : Trace, K: TraceableValue, V: TraceableValue](coreCommands: RedisCore[F, K, V],
+                                                                                   txCommands: HighLevelTx[F] & Watcher[F, K],
+                                                                                   transactionalRetryPolicy: F ~> F,
+                                                                                  ): TransactionalRedisCommandsAlgebra[F, K, V] = new TransactionalRedisCommandsAlgebraImpl(coreCommands, txCommands, transactionalRetryPolicy)
+
+  private class TransactionalRedisCommandsAlgebraImpl[F[_] : MonadCancelThrow : Trace, K: TraceableValue, V: TraceableValue](coreCommands: RedisCore[F, K, V],
+                                                                                                                             txCommands: HighLevelTx[F] & Watcher[F, K],
+                                                                                                                             transactionalRetryPolicy: F ~> F,
+                                                                                                                            ) extends TransactionalRedisCommandsAlgebra[F, K, V] {
+    private def executeIfValueIsUnchanged(key: K, existing: V)
+                                         (operations: List[F[Unit]]): F[Unit] = transactionalRetryPolicy {
+      txCommands.watch(key)
+        .bracket { _ =>
+          for {
+            currentValue <- coreCommands.get(key)
+            _ <- currentValue.traverse_(cv => Trace[F].put("currentValue" -> cv))
+            _ <- UpdateOrDeleteExistingRedisValueException(key, existing, currentValue).raiseError.unlessA(currentValue.contains(existing))
+            _ <- txCommands.transact_(operations)
+          } yield ()
+        }(_ => txCommands.unwatch)
     }
 
-  def deleteExisting(key: K, existing: V): F[Unit] =
-    Trace[F].span("TransactionalRedisCommandsAlgebra.deleteExisting") {
-      for {
-        _ <- Trace[F].put("key" -> key, "existing" -> existing)
-        _ <- executeIfValueIsUnchanged(key, existing)(List(del(key).void))
-      } yield ()
-    }
+    def updateExisting(key: K, existing: V)
+                      (newValue: V, expiresIn: FiniteDuration): F[Unit] =
+      Trace[F].span("TransactionalRedisCommandsAlgebra.updateExisting") {
+        val setArgs = SetArgs(SetArg.Ttl.Px(expiresIn))
+        for {
+          _ <- Trace[F].put("key" -> key, "existing" -> existing, "newValue" -> newValue, "setArgs" -> setArgs)
+          _ <- executeIfValueIsUnchanged(key, existing)(List(coreCommands.set(key, newValue, setArgs).void))
+        } yield ()
+      }
 
+    def deleteExisting(key: K, existing: V): F[Unit] =
+      Trace[F].span("TransactionalRedisCommandsAlgebra.deleteExisting") {
+        for {
+          _ <- Trace[F].put("key" -> key, "existing" -> existing)
+          _ <- executeIfValueIsUnchanged(key, existing)(List(coreCommands.del(key).void))
+        } yield ()
+      }
+  }
 }
