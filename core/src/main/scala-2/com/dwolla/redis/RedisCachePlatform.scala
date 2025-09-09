@@ -10,7 +10,7 @@ import com.dwolla.compat.scala.util.NotGiven
 import org.typelevel.scalaccompat.annotation.unused
 import scala.concurrent.duration.FiniteDuration
 
-trait RedisCachePlatform extends RedisCachePlatformLowPriority {
+private[redis] trait RedisCachePlatform extends RedisCachePlatformLowPriority {
   implicit def derivedAspect[K, V, Dom[_], Cod[_]](implicit @unused DK: Dom[K],
                                                    @unused DV: Dom[V],
                                                    @unused DFD: Dom[FiniteDuration],

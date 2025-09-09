@@ -8,7 +8,7 @@ import natchez.TraceableValue
 
 import scala.concurrent.duration.FiniteDuration
 
-trait RedisCachePlatform extends RedisCachePlatformLowPriority:
+private[redis] trait RedisCachePlatform extends RedisCachePlatformLowPriority:
   implicit def derivedAspect[K, V, Dom[_], Cod[_]](using Dom[K],
                                                    Dom[V],
                                                    Dom[FiniteDuration],
@@ -57,13 +57,13 @@ trait RedisCachePlatform extends RedisCachePlatformLowPriority:
       override def mapK[F[_], G[_]](af: RedisCache[F, K, V])(fk: F ~> G): RedisCache[G, K, V] =
         new RedisCacheMapKd(af, fk)
 
-trait RedisCachePlatformLowPriority extends RedisCachePlatformLowestPriority:
+private sealed trait RedisCachePlatformLowPriority extends RedisCachePlatformLowestPriority:
   this: RedisCachePlatform =>
 
   implicit def traceableValueAspect[K: TraceableValue, V: TraceableValue]: Aspect[[F[_]] =>> RedisCache[F, K, V], TraceableValue, TraceableValue] =
     derivedAspect[K, V, TraceableValue, TraceableValue]
 
-trait RedisCachePlatformLowestPriority:
+private sealed trait RedisCachePlatformLowestPriority:
   implicit def instrument[K, V]: Instrument[[F[_]] =>> RedisCache[F, K, V]] =
     new Instrument[[F[_]] =>> RedisCache[F, K, V]]:
       override def instrument[F[_]](af: RedisCache[F, K, V]): RedisCache[Instrumentation[F, *], K, V] =
