@@ -32,7 +32,7 @@ lazy val `redis4cats-transactional-updates` = project.in(file("core"))
     description := "Uses redis4cats to interact with the Redis transactions API to update or delete existing keys if and only if their value is the same as some expected value.",
     libraryDependencies ++= {
       Seq(
-        "dev.profunktor" %% "redis4cats-effects" % "2.0.1",
+        "dev.profunktor" %% "redis4cats-effects" % "2.0.3",
         "org.tpolecat" %% "natchez-core" % "0.3.8",
         "io.circe" %% "circe-core" % "0.14.15",
         "io.circe" %% "circe-literal" % "0.14.15",
