@@ -33,7 +33,7 @@ lazy val `redis4cats-transactional-updates` = project.in(file("core"))
     libraryDependencies ++= {
       Seq(
         "dev.profunktor" %% "redis4cats-effects" % "2.0.3",
-        "org.tpolecat" %% "natchez-core" % "0.3.9",
+        "org.tpolecat" %% "natchez-core" % "0.3.10",
         "io.circe" %% "circe-core" % "0.14.15",
         "io.circe" %% "circe-literal" % "0.14.15",
         "org.typelevel" %% "cats-tagless-core" % "0.16.5",
