@@ -6,8 +6,8 @@ import io.circe.*
 import io.circe.literal.*
 import io.circe.syntax.*
 import natchez.*
+import org.typelevel.scalaccompat.scala.util.NotGiven
 
-import com.dwolla.compat.scala.util.NotGiven
 import scala.concurrent.duration.*
 
 private[redis] object TraceableValueInstances {
