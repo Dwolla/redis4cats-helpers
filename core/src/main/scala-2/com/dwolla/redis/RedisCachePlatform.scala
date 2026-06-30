@@ -5,9 +5,9 @@ import cats.tagless.aop.{Aspect, Instrument}
 import com.dwolla.redis.TraceableValueInstances.*
 import dev.profunktor.redis4cats.effects
 import natchez.TraceableValue
-
-import com.dwolla.compat.scala.util.NotGiven
+import org.typelevel.scalaccompat.scala.util.NotGiven
 import org.typelevel.scalaccompat.annotation.unused
+
 import scala.concurrent.duration.FiniteDuration
 
 private[redis] trait RedisCachePlatform extends RedisCachePlatformLowPriority {
