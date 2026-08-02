@@ -38,7 +38,7 @@ lazy val `redis4cats-transactional-updates` = project.in(file("core"))
         "io.circe" %% "circe-literal" % "0.14.16",
         "org.typelevel" %% "cats-tagless-core" % "0.16.5",
         "org.typelevel" %% "scalac-compat-annotation" % "0.1.4",
-        "org.typelevel" %% "scalac-compat-features" % "0.1.4-145-821ab9f-SNAPSHOT",
+        "org.typelevel" %% "scalac-compat-features" % "0.1.5",
       ) ++ Seq(
         "org.typelevel" %% "cats-tagless-macros" % "0.16.5",
       ).filter(_ => scalaVersion.value.startsWith("2"))
